@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -217,8 +218,12 @@ int main(int argc, char *argv[])
 	for (;;) {
 		struct input_event ev;
 		err = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-		if (err != 0)
+		if (err != 0) {
+			if (err == -EAGAIN) {
+				(void)usleep(100);
+			}
 			continue;
+		}
 
 		if (!libevdev_event_is_type(&ev, EV_KEY))
 			continue;
