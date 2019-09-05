@@ -2,7 +2,7 @@
 Description=ctrlesc
 
 [Service]
-ExecStart=%h/src/ctrlesc/ctrlesc /dev/input/by-id/usb-05f3_0007-event-kbd
+ExecStart=%h/src/ctrlesc/ctrlesc /dev/input/by-id/usb-Kinesis_Advantage2_Keyboard_314159265359-if01-event-kbd
 Restart=always
 
 [Install]

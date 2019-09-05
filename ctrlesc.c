@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,12 +21,20 @@
 #define HANDLE_NOOP 0
 #define HANDLE_FORWARD 1
 
+#undef DEBUG
+
 struct mod_state {
 	int lctrl, rctrl;
 };
 
 static inline int ctrl_pressed(struct mod_state *mod)
 {
+#ifdef DEBUG
+	printf("ctrl_pressed=%d, %d != %d, %d != %d\n",
+	       mod->lctrl != KU || mod->rctrl != KU,
+	       mod->lctrl, KU,
+	       mod->rctrl, KU);
+#endif
 	return mod->lctrl != KU || mod->rctrl != KU;
 }
 
@@ -34,25 +43,25 @@ struct key_event {
 	int		value;
 };
 
-void print_event(const char *prefix, struct input_event *ev)
+static void print_event(const char *prefix, struct input_event *ev)
 {
+#ifdef DEBUG
 	/*
 	 * !!!           UNCOMMENT ONLY FOR DEBUGGING          !!!
 	 * !!! OTHERWISE ALL KEY PRESSES APPEAR IN SYSTEMD LOG !!!
 	 */
 
-	/*
-	   printf("%s event: %s %s %d\n",
-	   prefix,
-	   libevdev_event_type_get_name(ev->type),
-	   libevdev_event_code_get_name(ev->type, ev->code),
-	   ev->value);
-	   */
+	printf("%s event: %s %s %d\n",
+	       prefix,
+	       libevdev_event_type_get_name(ev->type),
+	       libevdev_event_code_get_name(ev->type, ev->code),
+	       ev->value);
+#endif
 }
 
-void send_keys(struct libevdev_uinput *uidev,
-	       struct key_event *ke,
-	       size_t n)
+static void send_keys(struct libevdev_uinput *uidev,
+		      struct key_event *ke,
+		      size_t n)
 {
 	int err;
 	for (size_t i = 0; i < n; i++) {
@@ -71,8 +80,8 @@ void send_keys(struct libevdev_uinput *uidev,
 	}
 }
 
-void forward(struct libevdev_uinput *uidev,
-	     struct input_event *ev)
+static void forward(struct libevdev_uinput *uidev,
+		    struct input_event *ev)
 {
 	struct key_event cp[] = {
 		{ ev->code, ev->value },
@@ -81,10 +90,10 @@ void forward(struct libevdev_uinput *uidev,
 	print_event("forward", ev);
 }
 
-int handle_key(struct libevdev_uinput *uidev,
-	       struct input_event *ev,
-	       struct input_event *prev,
-	       struct mod_state *mod)
+static int handle_key(struct libevdev_uinput *uidev,
+		      struct input_event *ev,
+		      struct input_event *prev,
+		      struct mod_state *mod)
 {
 	switch (ev->code) {
 	case KEY_F8:
@@ -165,17 +174,68 @@ int handle_key(struct libevdev_uinput *uidev,
 	return HANDLE_FORWARD;
 }
 
+static int handle_events(struct libevdev *dev, struct libevdev_uinput *uidev,
+			 struct mod_state *mod, struct input_event *prev)
+{
+
+	for (;;) {
+		struct input_event ev;
+		int err;
+
+		err = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+		switch (err) {
+		case LIBEVDEV_READ_STATUS_SUCCESS:
+			break;
+		case LIBEVDEV_READ_STATUS_SYNC:
+			perror("can't keep up");
+			return -1;
+		case -EAGAIN:
+			return 0;
+		default:
+			perror("unexpected error");
+			return -1;
+		}
+
+		if (!libevdev_event_is_type(&ev, EV_KEY))
+			continue;
+
+		print_event("receive", &ev);
+
+		switch (handle_key(uidev, &ev, prev, mod)) {
+		case HANDLE_EXIT:
+			return 0;
+		case HANDLE_FORWARD:
+			forward(uidev, &ev);
+			break;
+		}
+
+		switch (ev.code) {
+		case KEY_LEFTCTRL:
+			mod->lctrl = ev.value;
+			break;
+		case KEY_RIGHTCTRL:
+			mod->rctrl = ev.value;
+			break;
+		}
+
+		*prev = ev;
+	}
+}
+
 int main(int argc, char *argv[])
 {
+	struct libevdev_uinput *uidev;
+	struct input_event prev = {};
+	struct mod_state mod = {};
+	struct libevdev *dev;
+	struct pollfd pfd[1];
+	int err;
+	int fd;
+
 	if (argc <= 1) {
 		fprintf(stderr, "Please specify device name!\n");
 		return EXIT_FAILURE;
 	}
-
-	int fd;
-	int err;
-	struct libevdev *dev;
-	struct libevdev_uinput *uidev;
 
 	fd = open(argv[1], O_RDONLY|O_NONBLOCK);
 	err = libevdev_new_from_fd(fd, &dev);
@@ -194,6 +254,11 @@ int main(int argc, char *argv[])
 	}
 
 	fd = open("/dev/uinput", O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to open uinput (%s)\n", strerror(errno));
+		return EXIT_FAILURE;
+	}
+
 	err = libevdev_uinput_create_from_device(dev, fd, &uidev);
 	if (err < 0) {
 		fprintf(stderr, "Failed to create uinput (%s)\n", strerror(-err));
@@ -213,44 +278,13 @@ int main(int argc, char *argv[])
 
 	printf("Ready\n");
 
-	struct mod_state mod;
-	struct input_event prev;
-	for (;;) {
-		struct input_event ev;
-		err = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-		if (err != 0) {
-			if (err == -EAGAIN) {
-				(void)usleep(100);
-			}
-			continue;
-		}
+	pfd[0].fd = libevdev_get_fd(dev);
+	pfd[0].events = POLLIN;
 
-		if (!libevdev_event_is_type(&ev, EV_KEY))
-			continue;
-
-		print_event("receive", &ev);
-
-		switch (handle_key(uidev, &ev, &prev, &mod)) {
-		case HANDLE_EXIT:
-			goto done;
-		case HANDLE_FORWARD:
-			forward(uidev, &ev);
+	while (poll(pfd, ARRAY_SIZE(pfd), -1))
+		if (handle_events(dev, uidev, &mod, &prev))
 			break;
-		}
 
-		switch (ev.code) {
-		case KEY_LEFTCTRL:
-			mod.lctrl = ev.value;
-			break;
-		case KEY_RIGHTCTRL:
-			mod.rctrl = ev.value;
-			break;
-		}
-
-		prev = ev;
-	}
-
-done:
 	err = libevdev_grab(dev, LIBEVDEV_UNGRAB);
 	if (err < 0) {
 		fprintf(stderr, "Failed to grab device (%s)\n", strerror(-err));
